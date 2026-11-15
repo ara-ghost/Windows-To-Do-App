@@ -4,13 +4,17 @@ import json
 import math
 import os
 import re
+import sys
 import time
 import tkinter as tk
 from tkinter import font as tkfont
 import urllib.request
+import winreg
 
 DATA_FILE = os.path.join(os.path.expanduser("~"), "desktop_todos.json")
 FONT_DIR = os.path.join(os.path.expanduser("~"), ".desktop_todo_fonts")
+RUN_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+APP_REG_NAME = "DesktopTodoWidget"
 
 # Curated Apple-Inspired Themes
 THEMES = {
@@ -102,6 +106,33 @@ gdi32.AddFontResourceExW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_
 gdi32.AddFontResourceExW.restype = ctypes.c_int
 
 
+def get_startup_command():
+    """Returns the exact launch command whether running as .exe or .pyw."""
+    if getattr(sys, "frozen", False):
+        return f'"{os.path.abspath(sys.executable)}"'
+    return f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+
+
+def set_windows_autostart(enable=True):
+    """Registers or removes the app in HKCU Run so it starts automatically at boot."""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, RUN_REG_PATH, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enable:
+                winreg.SetValueEx(
+                    key, APP_REG_NAME, 0, winreg.REG_SZ, get_startup_command()
+                )
+            else:
+                try:
+                    winreg.DeleteValue(key, APP_REG_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
+
+
 def enable_retina_dpi():
     """Enables sharp High-DPI text rendering on Windows."""
     try:
@@ -164,7 +195,7 @@ class AppleDesktopTodoApp:
 
         # Calculate display DPI scale factor
         self.scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
-        self.width = self.s(346)
+        self.width = self.s(364)
         self.min_row_height = self.s(46)
         self.max_list_height = self.s(330)
 
@@ -199,11 +230,15 @@ class AppleDesktopTodoApp:
         self.state = self.load_state()
         self.tasks = self.state["tasks"]
         self.mode = self.state.get("mode", "wallpaper")
-        self.locked = self.state.get("locked", True)
+        self.locked = self.state.get("locked", False)
+        self.autostart = self.state.get("autostart", True)
         self.theme_name = self.state.get("theme", "ocean")
         if self.theme_name not in THEMES:
             self.theme_name = "ocean"
         self.t = THEMES[self.theme_name]
+
+        # Sync Windows Registry startup entry on launch
+        set_windows_autostart(self.autostart)
 
         x = self.state.get("x", self.s(60))
         y = self.state.get("y", self.s(60))
@@ -485,14 +520,30 @@ class AppleDesktopTodoApp:
             bg=self.t["pill"],
             fg=self.t["muted"] if self.mode == "wallpaper" else self.t["accent"],
             font=(self.font_text, 8, "bold"),
-            padx=self.s(8),
+            padx=self.s(7),
             pady=self.s(2),
             cursor="hand2",
         )
-        self.mode_btn.pack(side="right", padx=self.s(4), pady=(self.s(7), 0))
+        self.mode_btn.pack(side="right", padx=self.s(3), pady=(self.s(7), 0))
         self.mode_btn.bind("<Button-1>", lambda e: self.toggle_mode())
         self.mode_btn.bind("<Enter>", lambda e: self.mode_btn.config(bg=self.t["pill_hover"]))
         self.mode_btn.bind("<Leave>", lambda e: self.mode_btn.config(bg=self.t["pill"]))
+
+        # Auto-Start at Boot Pill
+        self.boot_btn = tk.Label(
+            self.header,
+            text="Boot",
+            bg=self.t["pill"],
+            fg=self.t["accent"] if self.autostart else self.t["muted"],
+            font=(self.font_text, 8, "bold"),
+            padx=self.s(7),
+            pady=self.s(2),
+            cursor="hand2",
+        )
+        self.boot_btn.pack(side="right", padx=self.s(3), pady=(self.s(7), 0))
+        self.boot_btn.bind("<Button-1>", lambda e: self.toggle_autostart())
+        self.boot_btn.bind("<Enter>", lambda e: self.boot_btn.config(bg=self.t["pill_hover"]))
+        self.boot_btn.bind("<Leave>", lambda e: self.boot_btn.config(bg=self.t["pill"]))
 
         # Clear Done Button
         self.clear_btn = tk.Label(
@@ -674,6 +725,15 @@ class AppleDesktopTodoApp:
             self.entry.delete(0, tk.END)
             self.set_placeholder()
 
+    def toggle_autostart(self):
+        self.autostart = not self.autostart
+        self.state["autostart"] = self.autostart
+        set_windows_autostart(self.autostart)
+        self.boot_btn.config(
+            fg=self.t["accent"] if self.autostart else self.t["muted"]
+        )
+        self.save_state()
+
     def toggle_lock(self):
         self.locked = not self.locked
         self.state["locked"] = self.locked
@@ -737,7 +797,8 @@ class AppleDesktopTodoApp:
             "y": self.s(60),
             "mode": "wallpaper",
             "theme": "ocean",
-            "locked": True,
+            "locked": False,
+            "autostart": True,
             "dpi_scaled": True,
             "tasks": [],
         }
@@ -863,7 +924,6 @@ class AppleDesktopTodoApp:
             )
 
             if is_urgent:
-                # Render individual characters with exact kerning for smooth wave jumps
                 lines = self.wrap_text(task["text"], text_max_w)
                 text_h = len(lines) * line_spacing
                 row_h = max(self.min_row_height, text_h + self.s(26))
