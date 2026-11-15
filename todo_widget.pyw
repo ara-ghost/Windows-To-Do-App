@@ -1,8 +1,10 @@
 import ctypes
 from ctypes import wintypes
 import json
+import math
 import os
 import re
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 import urllib.request
@@ -20,7 +22,7 @@ THEMES = {
         "divider": "#162D4D",
         "accent": "#38BDF8",     # Luminous sky/cyan blue
         "accent_hover": "#7DD3FC",
-        "danger": "#FF453A",
+        "danger": "#FF453A",     # Apple System Red
         "text": "#F1F5F9",
         "muted": "#7CA1C4",
         "done": "#4C6E91",
@@ -162,9 +164,9 @@ class AppleDesktopTodoApp:
 
         # Calculate display DPI scale factor
         self.scale = max(1.0, self.root.winfo_fpixels("1i") / 96.0)
-        self.width = self.s(336)
-        self.min_row_height = self.s(44)
-        self.max_list_height = self.s(320)
+        self.width = self.s(346)
+        self.min_row_height = self.s(46)
+        self.max_list_height = self.s(330)
 
         # Pick SF Pro if installed, otherwise Inter (loaded above), else Helvetica/Segoe
         available_fonts = set(tkfont.families())
@@ -192,6 +194,8 @@ class AppleDesktopTodoApp:
                 self.font_text = candidate
                 break
 
+        self.task_font = tkfont.Font(family=self.font_text, size=11, weight="bold")
+
         self.state = self.load_state()
         self.tasks = self.state["tasks"]
         self.mode = self.state.get("mode", "wallpaper")
@@ -203,13 +207,15 @@ class AppleDesktopTodoApp:
 
         x = self.state.get("x", self.s(60))
         y = self.state.get("y", self.s(60))
-        self.root.geometry(f"{self.width}x{self.s(152)}+{x}+{y}")
+        self.root.geometry(f"{self.width}x{self.s(154)}+{x}+{y}")
         self.root.configure(bg=self.t["bg"])
         self.root.attributes("-alpha", WIDGET_OPACITY)
 
         self._drag_x = 0
         self._drag_y = 0
         self._placeholder_active = False
+        self.urgent_letters = []
+        self._anim_after_id = None
 
         self.build_ui()
         self.render_tasks()
@@ -222,6 +228,7 @@ class AppleDesktopTodoApp:
         self.root.bind("<Unmap>", self.prevent_minimize)
         self.root.bind("<FocusOut>", self.on_focus_out)
         self.keep_alive_loop()
+        self.urgent_jump_loop()
 
     def s(self, val):
         return int(round(val * self.scale))
@@ -309,6 +316,94 @@ class AppleDesktopTodoApp:
     def on_focus_out(self, event=None):
         if self.mode == "wallpaper":
             self.root.after(50, self.apply_z_order)
+
+    def wrap_text(self, text, max_width):
+        """Splits text into lines fitting max_width while preserving exact kerning."""
+        words = text.split(" ")
+        lines = []
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            if self.task_font.measure(candidate) <= max_width:
+                current = candidate
+            else:
+                if current:
+                    lines.append(current)
+                    current = ""
+                if self.task_font.measure(word) <= max_width:
+                    current = word
+                else:
+                    chunk = ""
+                    for ch in word:
+                        if self.task_font.measure(chunk + ch) <= max_width:
+                            chunk += ch
+                        else:
+                            if chunk:
+                                lines.append(chunk)
+                            chunk = ch
+                    current = chunk
+        if current:
+            lines.append(current)
+        return lines if lines else [""]
+
+    def urgent_jump_loop(self):
+        self.trigger_urgent_bounce()
+        self.root.after(10000, self.urgent_jump_loop)
+
+    def trigger_urgent_bounce(self):
+        if not self.urgent_letters:
+            return
+        if self._anim_after_id is not None:
+            try:
+                self.root.after_cancel(self._anim_after_id)
+            except Exception:
+                pass
+            self._anim_after_id = None
+
+        letters = list(self.urgent_letters)
+        start_time = time.perf_counter()
+        stagger = 0.032        # 32ms wave delay between consecutive letters
+        hop1_dur = 0.38        # Primary smooth 9px hop
+        hop2_dur = 0.28        # Secondary smooth 4.5px bounce
+        letter_dur = hop1_dur + hop2_dur
+        max_idx = max((item[4] for item in letters), default=0)
+        total_dur = letter_dur + (max_idx * stagger)
+
+        amp1 = self.s(9)
+        amp2 = self.s(4.5)
+
+        def animate():
+            elapsed = time.perf_counter() - start_time
+            finished = elapsed >= total_dur
+
+            for canvas, item_id, bx, by, char_idx in letters:
+                try:
+                    if not canvas.winfo_exists():
+                        continue
+                    if finished:
+                        canvas.coords(item_id, bx, by)
+                        continue
+
+                    u = elapsed - (char_idx * stagger)
+                    if u <= 0.0 or u >= letter_dur:
+                        dy = 0.0
+                    elif u < hop1_dur:
+                        p = u / hop1_dur
+                        dy = -math.sin(p * math.pi) * amp1
+                    else:
+                        p = (u - hop1_dur) / hop2_dur
+                        dy = -math.sin(p * math.pi) * amp2
+
+                    canvas.coords(item_id, bx, by + dy)
+                except tk.TclError:
+                    pass
+
+            if not finished:
+                self._anim_after_id = self.root.after(16, animate)
+            else:
+                self._anim_after_id = None
+
+        animate()
 
     def draw_lock_icon(self):
         self.lock_btn.delete("all")
@@ -675,13 +770,30 @@ class AppleDesktopTodoApp:
         text = self.entry.get().strip()
         if not text:
             return
-        self.tasks.append({"text": text, "done": False})
+        self.tasks.append({"text": text, "done": False, "urgent": False})
         self.entry.delete(0, tk.END)
         self.save_state()
         self.render_tasks()
 
+    def toggle_urgent(self, index):
+        task = self.tasks.pop(index)
+        new_urgent = not task.get("urgent", False)
+        task["urgent"] = new_urgent
+        if new_urgent:
+            task["done"] = False
+            self.tasks.insert(0, task)
+        else:
+            insert_pos = sum(1 for t in self.tasks if t.get("urgent", False))
+            self.tasks.insert(insert_pos, task)
+        self.save_state()
+        self.render_tasks()
+        if new_urgent:
+            self.root.after(100, self.trigger_urgent_bounce)
+
     def toggle_task(self, index):
         self.tasks[index]["done"] = not self.tasks[index]["done"]
+        if self.tasks[index]["done"]:
+            self.tasks[index]["urgent"] = False
         self.save_state()
         self.render_tasks()
 
@@ -699,6 +811,7 @@ class AppleDesktopTodoApp:
         for widget in self.rows_frame.winfo_children():
             widget.destroy()
 
+        self.urgent_letters = []
         self.update_header_states()
 
         anchor_x = self.state.get("x", self.s(60))
@@ -719,10 +832,19 @@ class AppleDesktopTodoApp:
             return
 
         row_width = self.width - self.s(28)
-        text_max_w = row_width - self.s(60)
+        urg_w = self.s(44)
+        urg_h = self.s(19)
+        urg_x2 = row_width - self.s(22)
+        urg_x1 = urg_x2 - urg_w
+        urg_y1 = self.s(14)
+        urg_y2 = urg_y1 + urg_h
+
+        text_max_w = urg_x1 - self.s(46)
+        line_spacing = self.task_font.metrics("linespace")
         total_list_height = 0
 
         for idx, task in enumerate(self.tasks):
+            is_urgent = bool(task.get("urgent", False) and not task["done"])
             row = tk.Canvas(
                 self.rows_frame,
                 width=row_width,
@@ -734,45 +856,100 @@ class AppleDesktopTodoApp:
             )
             row.pack(fill="x")
 
-            # Auto-wrapping task text (expands vertically so nothing is ever cut off)
-            text_item = row.create_text(
-                self.s(36),
-                self.s(12),
-                text=task["text"],
-                fill=self.t["done"] if task["done"] else self.t["text"],
-                font=(self.font_text, 11, "bold"),
-                anchor="nw",
-                width=text_max_w,
+            text_color = (
+                self.t["done"]
+                if task["done"]
+                else (self.t["danger"] if is_urgent else self.t["text"])
             )
 
-            bbox = row.bbox(text_item)
-            text_h = (bbox[3] - bbox[1]) if bbox else self.s(20)
-            row_h = max(self.min_row_height, text_h + self.s(24))
-            row.config(height=row_h)
-            total_list_height += row_h
+            if is_urgent:
+                # Render individual characters with exact kerning for smooth wave jumps
+                lines = self.wrap_text(task["text"], text_max_w)
+                text_h = len(lines) * line_spacing
+                row_h = max(self.min_row_height, text_h + self.s(26))
+                row.config(height=row_h)
+                total_list_height += row_h
 
-            # Circular Apple-style checkbox aligned with the first line of text
+                char_counter = 0
+                for line_idx, line in enumerate(lines):
+                    base_y = self.s(14) + (line_idx * line_spacing)
+                    for c_idx, ch in enumerate(line):
+                        if ch != " ":
+                            base_x = self.s(36) + self.task_font.measure(line[:c_idx])
+                            item_id = row.create_text(
+                                base_x,
+                                base_y,
+                                text=ch,
+                                fill=text_color,
+                                font=self.task_font,
+                                anchor="nw",
+                            )
+                            self.urgent_letters.append(
+                                (row, item_id, base_x, base_y, char_counter)
+                            )
+                        char_counter += 1
+            else:
+                text_item = row.create_text(
+                    self.s(36),
+                    self.s(14),
+                    text=task["text"],
+                    fill=text_color,
+                    font=self.task_font,
+                    anchor="nw",
+                    width=text_max_w,
+                )
+                bbox = row.bbox(text_item)
+                text_h = (bbox[3] - bbox[1]) if bbox else self.s(20)
+                row_h = max(self.min_row_height, text_h + self.s(26))
+                row.config(height=row_h)
+                total_list_height += row_h
+
+            # Circular Apple-style checkbox aligned with the top line
             if task["done"]:
                 circle = row.create_oval(
-                    self.s(6), self.s(12), self.s(25), self.s(31),
+                    self.s(6), self.s(14), self.s(25), self.s(33),
                     fill=self.t["accent"], outline=self.t["accent"],
                 )
                 row.create_line(
                     self.s(11.0),
-                    self.s(21.8),
+                    self.s(23.8),
                     self.s(14.2),
-                    self.s(25.0),
+                    self.s(27.0),
                     self.s(20.2),
-                    self.s(18.2),
+                    self.s(20.2),
                     fill="#FFFFFF",
                     width=2.0 * self.scale,
                     capstyle="round",
                     joinstyle="round",
                 )
             else:
+                ring_color = self.t["danger"] if is_urgent else self.t["done"]
                 circle = row.create_oval(
-                    self.s(6), self.s(12), self.s(25), self.s(31),
-                    fill=self.t["bg"], outline=self.t["done"], width=1.8 * self.scale,
+                    self.s(6), self.s(14), self.s(25), self.s(33),
+                    fill=self.t["bg"], outline=ring_color, width=1.8 * self.scale,
+                )
+
+            # Small "Urgent" Pill Button (on active tasks)
+            urg_bg = None
+            urg_lbl = None
+            if not task["done"]:
+                urg_bg = draw_rounded_rect(
+                    row,
+                    urg_x1,
+                    urg_y1,
+                    urg_x2,
+                    urg_y2,
+                    self.s(7),
+                    fill=self.t["danger"] if is_urgent else self.t["pill"],
+                    outline=self.t["danger"] if is_urgent else self.t["divider"],
+                    width=1,
+                )
+                urg_lbl = row.create_text(
+                    (urg_x1 + urg_x2) / 2,
+                    (urg_y1 + urg_y2) / 2,
+                    text="Urgent",
+                    fill="#FFFFFF" if is_urgent else self.t["muted"],
+                    font=(self.font_text, 7, "bold"),
                 )
 
             # Inset separator between rows
@@ -788,35 +965,80 @@ class AppleDesktopTodoApp:
             # Hover-only delete button
             del_item = row.create_text(
                 row_width - self.s(10),
-                self.s(21),
+                self.s(23.5),
                 text="✕",
                 fill=self.t["bg"],
                 font=(self.font_text, 9, "bold"),
             )
 
-            def on_row_click(event, i=idx, rw=row_width):
-                if event.x >= rw - self.s(24):
+            def on_row_click(
+                event,
+                i=idx,
+                rw=row_width,
+                done=task["done"],
+                ux1=urg_x1,
+                ux2=urg_x2,
+                uy1=urg_y1,
+                uy2=urg_y2,
+            ):
+                if event.x >= rw - self.s(20):
                     self.delete_task(i)
+                elif (
+                    not done
+                    and ux1 <= event.x <= ux2
+                    and (uy1 - self.s(4)) <= event.y <= (uy2 + self.s(4))
+                ):
+                    self.toggle_urgent(i)
                 else:
                     self.toggle_task(i)
 
-            def on_row_enter(event, r=row, d=del_item, c=circle, done=task["done"]):
+            def on_row_enter(
+                event, r=row, d=del_item, c=circle, done=task["done"], urg=is_urgent
+            ):
                 r.itemconfig(d, fill=self.t["muted"])
-                if not done:
+                if not done and not urg:
                     r.itemconfig(c, outline=self.t["accent"])
 
-            def on_row_leave(event, r=row, d=del_item, c=circle, done=task["done"]):
+            def on_row_leave(
+                event,
+                r=row,
+                d=del_item,
+                c=circle,
+                done=task["done"],
+                urg=is_urgent,
+                ub=urg_bg,
+                ul=urg_lbl,
+            ):
                 r.itemconfig(d, fill=self.t["bg"])
-                if not done:
+                if not done and not urg:
                     r.itemconfig(c, outline=self.t["done"])
+                if ub and ul and not urg:
+                    r.itemconfig(ub, outline=self.t["divider"])
+                    r.itemconfig(ul, fill=self.t["muted"])
 
-            def on_row_motion(event, r=row, d=del_item, rw=row_width):
+            def on_row_motion(
+                event,
+                r=row,
+                d=del_item,
+                rw=row_width,
+                urg=is_urgent,
+                ub=urg_bg,
+                ul=urg_lbl,
+                ux1=urg_x1,
+                ux2=urg_x2,
+                uy1=urg_y1,
+                uy2=urg_y2,
+            ):
                 r.itemconfig(
                     d,
                     fill=self.t["danger"]
-                    if event.x >= rw - self.s(24)
+                    if event.x >= rw - self.s(20)
                     else self.t["muted"],
                 )
+                if ub and ul and not urg:
+                    over_urg = ux1 <= event.x <= ux2 and (uy1 - self.s(4)) <= event.y <= (uy2 + self.s(4))
+                    r.itemconfig(ub, outline=self.t["danger"] if over_urg else self.t["divider"])
+                    r.itemconfig(ul, fill=self.t["danger"] if over_urg else self.t["muted"])
 
             row.bind("<Button-1>", on_row_click)
             row.bind("<Enter>", on_row_enter)
